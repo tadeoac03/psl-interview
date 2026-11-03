@@ -1,0 +1,336 @@
+openapi: 3.0.3
+info:
+  title: Fitness Studio Class Booking API
+  version: 1.0.0
+  description: |
+    Members book seats in classes. Full classes have a FIFO waitlist; cancelling a confirmed
+    seat promotes the first waitlisted member who is not confirmed in an overlapping class.
+
+    * Studio time zone: America/New_York. All times are ISO-8601 UTC (`2026-11-02T23:00:00Z`).
+    * Member-scoped endpoints require the `X-Member-Id` header.
+    * Every error uses the same envelope: `{ "error": "<code>", "message": "<text>", ...context }`.
+servers:
+  - url: http://localhost:8000
+tags:
+  - name: Classes
+  - name: Bookings
+  - name: Members
+paths:
+  /api/classes:
+    get:
+      tags: [Classes]
+      operationId: listClasses
+      summary: Classes starting on a local date
+      description: Non-cancelled classes whose start falls on `date` in time zone `tz`, sorted by start.
+      parameters:
+        - name: date
+          in: query
+          required: false
+          description: Local calendar date (YYYY-MM-DD). Defaults to today in `tz`.
+          schema: { type: string, format: date, example: '2026-11-02' }
+        - name: tz
+          in: query
+          required: false
+          description: IANA time zone. Defaults to the studio time zone.
+          schema: { type: string, example: America/New_York, default: America/New_York }
+      responses:
+        '200':
+          description: Classes of the day
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ClassSummary' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [Classes]
+      operationId: createClass
+      summary: Schedule a class
+      parameters:
+        - $ref: '#/components/parameters/MemberId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateClassRequest' }
+      responses:
+        '201':
+          description: Class created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClassSummary' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /api/classes/{classId}/bookings:
+    post:
+      tags: [Bookings]
+      operationId: bookSeat
+      summary: Book a seat (or join the waitlist)
+      description: |
+        Confirms a seat while there is capacity, otherwise joins the waitlist.
+        Retrying with the same `Idempotency-Key` replays the original response and never creates
+        a second booking.
+      parameters:
+        - $ref: '#/components/parameters/ClassId'
+        - $ref: '#/components/parameters/MemberId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Booking created (confirmed or waitlisted)
+          headers:
+            Idempotency-Replayed:
+              description: Present with value `true` when the response is a replay.
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+              examples:
+                confirmed:
+                  value: { id: 01a19d99-73ac-73d5-b675-75c18ed9153b, classId: 01a19d99-3d8f-7304-9387-71c5b8b19431, memberId: m-1, status: confirmed }
+                waitlisted:
+                  value: { id: 01a19d99-7451-73a4-b0a9-eed9c2772bd3, classId: 01a19d99-3d8f-7304-9387-71c5b8b19431, memberId: m-2, status: waitlisted, position: 3 }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: Unknown class
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: class_not_found, message: The class does not exist. }
+        '409':
+          description: |
+            * `already_booked` – the member already holds an active booking for the class.
+            * `schedule_conflict` – a seat is free but the member is confirmed in an overlapping class.
+            * `class_already_started` / `class_cancelled` – the class cannot be booked.
+            * `idempotency_key_in_use` – a request with the same key is still in flight.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/ScheduleConflictError'
+                  - $ref: '#/components/schemas/Error'
+              examples:
+                alreadyBooked:
+                  value: { error: already_booked, message: You already hold a booking for this class. }
+                scheduleConflict:
+                  value:
+                    error: schedule_conflict
+                    message: You are already confirmed in a class that overlaps with this one.
+                    conflictsWith: { id: 01a19d99-3d8f-7304-9387-71c5b815347e, name: Pilates Core, start: '2026-11-02T23:30:00Z', end: '2026-11-03T00:30:00Z' }
+        '422':
+          description: Invalid Idempotency-Key or key reused for a different request (`idempotency_key_mismatch`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/bookings/{bookingId}:
+    delete:
+      tags: [Bookings]
+      operationId: cancelBooking
+      summary: Cancel a booking
+      description: |
+        Idempotent for the owner: cancelling an already-cancelled booking returns 204.
+        If the booking held a confirmed seat, the first eligible waitlisted member is promoted.
+        Bookings of other members are reported as 404.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '204': { description: Cancelled }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: Unknown booking or booking of another member
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: booking_not_found, message: The booking does not exist. }
+  /api/members/{memberId}/bookings:
+    get:
+      tags: [Members]
+      operationId: listMemberBookings
+      summary: Active (confirmed and waitlisted) bookings of a member
+      parameters:
+        - $ref: '#/components/parameters/PathMemberId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '200':
+          description: Active bookings, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MemberBooking' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/members/{memberId}/bookings/cancelled:
+    get:
+      tags: [Members]
+      operationId: listMemberCancelledBookings
+      summary: Cancelled bookings of a member
+      parameters:
+        - $ref: '#/components/parameters/PathMemberId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '200':
+          description: Cancelled bookings, most recently cancelled first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CancelledBooking' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+components:
+  parameters:
+    MemberId:
+      name: X-Member-Id
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 100 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Scoped per member, retained for 24 hours.
+      schema: { type: string, maxLength: 255 }
+    ClassId:
+      name: classId
+      in: path
+      required: true
+      schema: { type: string }
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema: { type: string }
+    PathMemberId:
+      name: memberId
+      in: path
+      required: true
+      description: Must match X-Member-Id.
+      schema: { type: string }
+  responses:
+    Unauthenticated:
+      description: Missing or invalid X-Member-Id
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: unauthenticated, message: A valid X-Member-Id header is required. }
+    Forbidden:
+      description: X-Member-Id does not match the requested member
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: forbidden, message: You cannot access bookings of another member. }
+    ValidationError:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ValidationError' }
+  schemas:
+    UtcDateTime:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+      example: '2026-11-02T23:00:00Z'
+    ClassSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name, start, end, capacity, booked, waitlisted, seatsLeft]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        start: { $ref: '#/components/schemas/UtcDateTime' }
+        end: { $ref: '#/components/schemas/UtcDateTime' }
+        capacity: { type: integer, minimum: 1 }
+        booked: { type: integer, minimum: 0, description: Confirmed seats }
+        waitlisted: { type: integer, minimum: 0 }
+        seatsLeft: { type: integer, minimum: 0 }
+    ClassReference:
+      type: object
+      additionalProperties: false
+      required: [id, name, start, end]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        start: { $ref: '#/components/schemas/UtcDateTime' }
+        end: { $ref: '#/components/schemas/UtcDateTime' }
+    CreateClassRequest:
+      type: object
+      required: [name, start, end, capacity]
+      properties:
+        name: { type: string, maxLength: 100 }
+        start: { $ref: '#/components/schemas/UtcDateTime' }
+        end: { $ref: '#/components/schemas/UtcDateTime' }
+        capacity: { type: integer, minimum: 1, maximum: 1000 }
+    BookingStatus:
+      type: string
+      enum: [confirmed, waitlisted, cancelled]
+    Booking:
+      type: object
+      additionalProperties: false
+      required: [id, classId, memberId, status]
+      properties:
+        id: { type: string, format: uuid }
+        classId: { type: string, format: uuid }
+        memberId: { type: string }
+        status: { type: string, enum: [confirmed, waitlisted] }
+        position: { type: integer, minimum: 1, description: Only when waitlisted }
+    MemberBooking:
+      type: object
+      additionalProperties: false
+      required: [id, classId, status]
+      properties:
+        id: { type: string, format: uuid }
+        classId: { type: string, format: uuid }
+        status: { type: string, enum: [confirmed, waitlisted] }
+        position: { type: integer, minimum: 1, description: Only when waitlisted }
+    CancelledBooking:
+      type: object
+      additionalProperties: false
+      required: [id, classId, status, cancelledAt]
+      properties:
+        id: { type: string, format: uuid }
+        classId: { type: string, format: uuid }
+        status: { type: string, enum: [cancelled] }
+        cancelledAt: { $ref: '#/components/schemas/UtcDateTime' }
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code
+          enum:
+            - unauthenticated
+            - forbidden
+            - not_found
+            - class_not_found
+            - booking_not_found
+            - already_booked
+            - schedule_conflict
+            - class_already_started
+            - class_cancelled
+            - idempotency_key_in_use
+            - idempotency_key_mismatch
+            - validation_error
+            - method_not_allowed
+            - internal_error
+        message: { type: string }
+    ScheduleConflictError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          required: [conflictsWith]
+          properties:
+            conflictsWith: { $ref: '#/components/schemas/ClassReference' }
+    ValidationError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          required: [details]
+          properties:
+            details:
+              type: object
+              additionalProperties:
+                type: array
+                items: { type: string }
