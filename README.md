@@ -1,94 +1,81 @@
-# Fitness Studio Class Booking API
+# API de Reservas de Clases para un Estudio Fitness
 
-A Laravel 13 API that lets members browse a studio's class schedule, book seats, join a waitlist when a class is full, and cancel bookings.
+API REST en Laravel 13 y PostgreSQL. Los miembros de un estudio consultan el horario, reservan lugares en clases, entran a una lista de espera cuando la clase está llena y cancelan reservas. Al cancelar un lugar confirmado, se promueve automáticamente al siguiente miembro elegible de la lista.
 
-## Features
+Este README resume las decisiones técnicas globales. El detalle está en [`docs/`](#documentación).
 
-- **Seat booking with FIFO waitlist.** If a class has a free seat, the booking is confirmed. If not, the member joins the waitlist.
-- **Automatic promotion.** Cancelling a confirmed seat promotes the first waitlisted member who is not already confirmed in an overlapping class.
-- **Schedule conflict detection.** A member can't hold confirmed seats in two classes that overlap in time. They can still wait for an overlapping class.
-- **Concurrency-safe.** Seats are allocated under a row lock on the class, and each member's overlap check runs under a Postgres advisory lock.
-- **Idempotent writes.** `POST` requests accept an `Idempotency-Key` header. A retry replays the stored response, and reusing a key with a different payload is rejected.
-- **Time zone aware.** Classes are listed by local calendar date, and DST days of 23 or 25 hours are handled correctly.
-- **Consistent error envelope.** Every error has the shape `{ "error": "<code>", "message": "<text>", ...context }`.
+## Arranque rápido
 
-## Requirements
-
-- PHP 8.3+
-- Composer
-- PostgreSQL
-- Node.js and npm (only for the Vite asset build)
-
-## Setup
+Requisitos: PHP 8.3+, Composer, PostgreSQL y Node.js (solo para el build de Vite).
 
 ```bash
-cp .env.example .env          # then set your DB_* credentials
-createdb studio
-createdb studio_test          # used by the test suite
-composer setup                # install deps, generate key, migrate, build assets
-php artisan serve
-```
-
-The API is served at `http://localhost:8000/api`.
-
-### Configuration
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `STUDIO_TIMEZONE` | `America/New_York` | Studio time zone; default for date-based queries |
-| `STUDIO_IDEMPOTENCY_TTL_HOURS` | `24` | How long an idempotent response is replayed |
-
-## API
-
-The full contract is in [`resources/openapi/booking-api.yaml`](resources/openapi/booking-api.yaml) (OpenAPI 3.0). The test suite validates responses against this spec.
-
-All times are ISO-8601 UTC (for example `2026-11-02T23:00:00Z`). Member-scoped endpoints require the `X-Member-Id` header.
-
-| Method | Endpoint | Auth | Description |
-| --- | --- | --- | --- |
-| `GET` | `/api/classes?date=YYYY-MM-DD&tz=Zone` | Public | Classes starting on a local date |
-| `POST` | `/api/classes` | `X-Member-Id` | Create a class |
-| `POST` | `/api/classes/{classId}/bookings` | `X-Member-Id` | Book a seat or join the waitlist |
-| `DELETE` | `/api/bookings/{bookingId}` | `X-Member-Id` | Cancel a booking (safe to repeat) |
-| `GET` | `/api/members/{memberId}/bookings` | `X-Member-Id` | The member's active bookings |
-| `GET` | `/api/members/{memberId}/bookings/cancelled` | `X-Member-Id` | The member's cancelled bookings |
-
-### Example
-
-```bash
-curl -X POST http://localhost:8000/api/classes/{classId}/bookings \
-  -H "X-Member-Id: member-123" \
-  -H "Idempotency-Key: 7f1c9b2e-booking-1" \
-  -H "Accept: application/json"
-```
-
-### Error codes
-
-| Status | Code |
-| --- | --- |
-| 401 | `unauthenticated` |
-| 403 | `forbidden` |
-| 404 | `class_not_found`, `booking_not_found`, `not_found` |
-| 409 | `already_booked`, `schedule_conflict`, `class_already_started`, `class_cancelled`, `idempotency_key_in_use` |
-| 422 | `validation_error`, `idempotency_key_mismatch` |
-
-## Architecture
-
-The booking module lives in `app/Booking` and follows a hexagonal (ports and adapters) layout:
-
-```
-app/Booking/
-├── Domain/          # Entities, value objects, domain exceptions and ports (interfaces)
-├── Application/     # Use cases: BookSeat, CancelBooking, CreateClass, ListClasses, ListMemberBookings
-└── Infrastructure/  # Laravel adapters: HTTP controllers, middleware, Eloquent repositories, locks
-```
-
-The domain and application layers don't depend on Laravel. Infrastructure binds the ports to their implementations in `BookingServiceProvider`.
-
-## Testing
-
-```bash
+cp .env.example .env          # configura las credenciales DB_*
+createdb studio && createdb studio_test
+composer setup                # dependencias, key, migraciones y assets
+php artisan db:seed           # horario de demo (opcional)
+php artisan serve             # http://localhost:8000/api
 composer test
 ```
 
-Feature tests cover booking, cancellation and promotion, idempotency, concurrent booking, time zone listing and member bookings. They run against the `studio_test` Postgres database.
+| Variable | Por defecto | Uso |
+|---|---|---|
+| `STUDIO_TIMEZONE` | `America/New_York` | Zona horaria del estudio para listar clases por día |
+| `STUDIO_IDEMPOTENCY_TTL_HOURS` | `24` | Vigencia de una `Idempotency-Key` |
+
+## Qué expone
+
+| Método | Ruta | Para qué |
+|---|---|---|
+| `GET` | `/api/classes` | Horario de un día local (público) |
+| `POST` | `/api/classes` | Crear una clase |
+| `POST` | `/api/classes/{classId}/bookings` | Reservar un lugar o entrar a la lista de espera |
+| `DELETE` | `/api/bookings/{bookingId}` | Cancelar una reserva propia |
+| `GET` | `/api/members/{memberId}/bookings` | Reservas activas del miembro |
+| `GET` | `/api/members/{memberId}/bookings/cancelled` | Reservas canceladas del miembro |
+
+Parámetros, respuestas y errores por endpoint están en [`docs/api.md`](docs/api.md).
+
+## Decisiones técnicas
+
+### Arquitectura
+
+- **Hexagonal (puertos y adaptadores)** en un solo bounded context, `app/Booking/`, con tres capas: `Domain`, `Application` e `Infrastructure`. El dominio y los casos de uso no dependen de Laravel; `BookingServiceProvider` conecta cada puerto con su adaptador.
+- **Un caso de uso por clase** (`BookSeat`, `CancelBooking`, …). Los controllers son delgados: validan, llaman al caso de uso y transforman la salida con un Resource. No contienen reglas de negocio.
+- **CQRS ligero:** las escrituras pasan por entidades y repositorios; las lecturas usan un read model con consultas agregadas que devuelve DTOs.
+- **Dependencias externas detrás de puertos:** reloj, UUIDs, transacciones, locks y notificaciones. Así el dominio se prueba sin infraestructura y cada adaptador se puede reemplazar.
+
+### Contrato y forma de la API
+
+- **Contract-first:** `resources/openapi/booking-api.yaml` es la fuente de verdad. Los tests validan cada respuesta contra el spec, así que el código no puede divergir del contrato.
+- **Un solo sobre de error** para toda la API: `{ "error", "message", ...contexto }`, con códigos estables. Las excepciones de dominio no conocen HTTP; un renderer central las traduce.
+- **Solo se exponen UUIDv7**; los ids enteros son internos. Todas las fechas son ISO-8601 UTC.
+- **Validación en capas:** forma de la entrada en Form Requests, invariantes en las entidades, reglas de negocio en los casos de uso y constraints en la base como última red de seguridad.
+
+### Consistencia y concurrencia
+
+- **PostgreSQL por diseño, no por gusto:** se usan `SELECT … FOR UPDATE`, advisory locks e índices únicos parciales. Las pruebas corren contra Postgres, no contra SQLite.
+- **Locks explícitos con orden fijo:** primero la clase (evita sobreventa del último lugar) y luego el miembro (evita quedar confirmado en dos clases traslapadas). Un índice único parcial garantiza una sola reserva activa por miembro y clase.
+- **Reintentos seguros:** los `POST` aceptan `Idempotency-Key` con alcance por miembro, y cancelar dos veces no tiene efecto adicional.
+- **Notificaciones después del commit**, para no avisar de algo que luego se revierte.
+
+### Seguridad y acceso
+
+- **Identidad por header `X-Member-Id`**, pensada para ir detrás de un gateway que ya autenticó. No hay tokens ni tabla de miembros.
+- **Sin fuga de información entre miembros:** una reserva ajena responde `404`, como si no existiera.
+- **Sin rate limiting ni roles por ahora:** cualquier miembro puede crear clases. Ambos están en el backlog.
+
+### Tiempo
+
+- La app y la conexión a la base trabajan en **UTC**. La zona del estudio solo se usa para definir qué es "un día" al listar clases, incluidos los días de 23 o 25 horas por cambio de horario.
+- La hora actual sale del puerto `Clock`, nunca de `now()`, para que las pruebas la controlen.
+
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [`docs/global-rules.md`](docs/global-rules.md) | Reglas de negocio acordadas: reservas, lista de espera, traslapes, acceso y reintentos |
+| [`docs/api.md`](docs/api.md) | Endpoints, headers, validaciones, respuestas, idempotencia y códigos de error |
+| [`docs/architecture.md`](docs/architecture.md) | Capas, reglas de dependencia, dónde vive cada regla, validación, concurrencia y tiempo |
+| [`docs/database.md`](docs/database.md) | Tablas, índices, constraints, decisiones de modelado, seeders y factories |
+| [`docs/testing.md`](docs/testing.md) | Estructura y convenciones de pruebas, validación OpenAPI, tests de concurrencia y riesgos cubiertos |
+| [`docs/post-mvp.md`](docs/post-mvp.md) | Lo que quedó fuera del MVP, pendientes operativos y preguntas abiertas |

@@ -146,3 +146,18 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 - Run `vendor/bin/phpunit` to call the test runner directly. It accepts the same file path and `--filter=testName` arguments.
 
 </laravel-boost-guidelines>
+
+# Documentación del proyecto (`docs/`)
+
+> **Nota sobre el idioma:** esta sección está escrita en español, a diferencia del resto de este archivo, porque el usuario lo solicitó explícitamente como demostración. Las reglas de Boost de arriba se mantienen en inglés porque Boost las genera y las regenera.
+
+API REST de reservas de clases para un estudio de fitness (arquitectura hexagonal, OpenAPI contract-first, Postgres). No cargues todos los documentos de entrada: lee solo los que correspondan a la tarea, según la tabla. Si un documento contradice al código, manda el código (y `resources/openapi/booking-api.yaml` en lo que toca a la API), y hay que corregir el documento.
+
+| Documento | Contenido | Léelo cuando |
+|---|---|---|
+| `docs/global-rules.md` | Reglas de negocio y decisiones de producto acordadas: reservas, lista de espera, traslapes, acceso (401/403/404), reintentos, formato de error y convenciones | Antes de cambiar cualquier comportamiento o agregar una funcionalidad; cuando no sepas si algo está permitido |
+| `docs/api.md` | Endpoints, headers (`X-Member-Id`, `Idempotency-Key`), forma de peticiones y respuestas, status y códigos de error por endpoint | Al agregar o cambiar endpoints, respuestas, validaciones o códigos de error (actualiza primero el YAML de OpenAPI) |
+| `docs/architecture.md` | Capas hexagonales en `app/Booking/`, reglas de dependencia, dónde vive cada regla, puertos y adaptadores, estrategia de locks y concurrencia, manejo del tiempo | Al crear o mover clases, agregar un caso de uso, puerto o adaptador, o tocar transacciones o locks |
+| `docs/database.md` | Configuración de Postgres, tablas, columnas, índices y restricciones, id vs. uuid, campos calculados (`position`, ocupación), seeders y factories | Al escribir migraciones, consultas o repositorios, cambiar modelos o sembrar datos |
+| `docs/testing.md` | Estructura de los tests, helpers de `BookingApiTestCase` y validación automática contra OpenAPI, convenciones, tests de concurrencia y riesgos cubiertos | Al escribir o cambiar tests, o después de cualquier cambio de comportamiento |
+| `docs/post-mvp.md` | Huecos conocidos y trabajo pospuesto, pendientes de operación, dependencias sin usar y preguntas abiertas | Al planear el siguiente trabajo, o cuando una petición toque algo listado como pendiente |
