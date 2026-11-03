@@ -1,58 +1,94 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Fitness Studio Class Booking API
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A Laravel 13 API that lets members browse a studio's class schedule, book seats, join a waitlist when a class is full, and cancel bookings.
 
-## About Laravel
+## Features
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+- **Seat booking with FIFO waitlist.** If a class has a free seat, the booking is confirmed. If not, the member joins the waitlist.
+- **Automatic promotion.** Cancelling a confirmed seat promotes the first waitlisted member who is not already confirmed in an overlapping class.
+- **Schedule conflict detection.** A member can't hold confirmed seats in two classes that overlap in time. They can still wait for an overlapping class.
+- **Concurrency-safe.** Seats are allocated under a row lock on the class, and each member's overlap check runs under a Postgres advisory lock.
+- **Idempotent writes.** `POST` requests accept an `Idempotency-Key` header. A retry replays the stored response, and reusing a key with a different payload is rejected.
+- **Time zone aware.** Classes are listed by local calendar date, and DST days of 23 or 25 hours are handled correctly.
+- **Consistent error envelope.** Every error has the shape `{ "error": "<code>", "message": "<text>", ...context }`.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+## Requirements
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+- PHP 8.3+
+- Composer
+- PostgreSQL
+- Node.js and npm (only for the Vite asset build)
 
-## Learning Laravel
-
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+## Setup
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+cp .env.example .env          # then set your DB_* credentials
+createdb studio
+createdb studio_test          # used by the test suite
+composer setup                # install deps, generate key, migrate, build assets
+php artisan serve
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+The API is served at `http://localhost:8000/api`.
 
-## Contributing
+### Configuration
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+| Variable | Default | Description |
+| --- | --- | --- |
+| `STUDIO_TIMEZONE` | `America/New_York` | Studio time zone; default for date-based queries |
+| `STUDIO_IDEMPOTENCY_TTL_HOURS` | `24` | How long an idempotent response is replayed |
 
-## Code of Conduct
+## API
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+The full contract is in [`resources/openapi/booking-api.yaml`](resources/openapi/booking-api.yaml) (OpenAPI 3.0). The test suite validates responses against this spec.
 
-## Security Vulnerabilities
+All times are ISO-8601 UTC (for example `2026-11-02T23:00:00Z`). Member-scoped endpoints require the `X-Member-Id` header.
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+| Method | Endpoint | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/api/classes?date=YYYY-MM-DD&tz=Zone` | Public | Classes starting on a local date |
+| `POST` | `/api/classes` | `X-Member-Id` | Create a class |
+| `POST` | `/api/classes/{classId}/bookings` | `X-Member-Id` | Book a seat or join the waitlist |
+| `DELETE` | `/api/bookings/{bookingId}` | `X-Member-Id` | Cancel a booking (safe to repeat) |
+| `GET` | `/api/members/{memberId}/bookings` | `X-Member-Id` | The member's active bookings |
+| `GET` | `/api/members/{memberId}/bookings/cancelled` | `X-Member-Id` | The member's cancelled bookings |
 
-## License
+### Example
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+```bash
+curl -X POST http://localhost:8000/api/classes/{classId}/bookings \
+  -H "X-Member-Id: member-123" \
+  -H "Idempotency-Key: 7f1c9b2e-booking-1" \
+  -H "Accept: application/json"
+```
+
+### Error codes
+
+| Status | Code |
+| --- | --- |
+| 401 | `unauthenticated` |
+| 403 | `forbidden` |
+| 404 | `class_not_found`, `booking_not_found`, `not_found` |
+| 409 | `already_booked`, `schedule_conflict`, `class_already_started`, `class_cancelled`, `idempotency_key_in_use` |
+| 422 | `validation_error`, `idempotency_key_mismatch` |
+
+## Architecture
+
+The booking module lives in `app/Booking` and follows a hexagonal (ports and adapters) layout:
+
+```
+app/Booking/
+├── Domain/          # Entities, value objects, domain exceptions and ports (interfaces)
+├── Application/     # Use cases: BookSeat, CancelBooking, CreateClass, ListClasses, ListMemberBookings
+└── Infrastructure/  # Laravel adapters: HTTP controllers, middleware, Eloquent repositories, locks
+```
+
+The domain and application layers don't depend on Laravel. Infrastructure binds the ports to their implementations in `BookingServiceProvider`.
+
+## Testing
+
+```bash
+composer test
+```
+
+Feature tests cover booking, cancellation and promotion, idempotency, concurrent booking, time zone listing and member bookings. They run against the `studio_test` Postgres database.
